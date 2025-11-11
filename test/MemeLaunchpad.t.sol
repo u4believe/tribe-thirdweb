@@ -48,7 +48,6 @@ contract MemeLaunchpadTest is Test {
         assertEq(info.symbol, symbol, "Token symbol mismatch");
         assertEq(info.metadata, metadata, "Token metadata mismatch");
         assertEq(info.creator, creator, "Token creator mismatch");
-        assertEq(info.creatorAllocation, 0, "Creator allocation should be 0");
         assertEq(info.maxSupply, 1_000_000_000 * 1e18, "Max supply mismatch");
         assertEq(info.currentSupply, 0, "Current supply should be 0");
         assertFalse(info.completed, "Token should not be completed");
@@ -188,5 +187,306 @@ contract MemeLaunchpadTest is Test {
         vm.prank(nonOwner);
         vm.expectRevert(abi.encodeWithSelector(0x118cdaa7, nonOwner));
         launchpad.completeTokenLaunch(tokenAddress);
+    }
+
+    // ==================== CREATOR BUY LIMIT TESTS ====================
+
+    function testCreatorCanBuyWithinLimit() public {
+        // Create token as creator
+        vm.prank(creator);
+        address tokenAddress = launchpad.createToken("CreatorToken", "CT", "Creator metadata");
+
+        // Calculate creator max buy: 20% of bonding curve (70% of 1B = 140M tokens)
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 bondingMax = (maxSupply * 70) / 100; // 700M tokens
+        uint256 creatorMaxBuy = (bondingMax * 20) / 100; // 140M tokens
+
+        // Give creator enough ETH to buy a small amount within limit
+        uint256 ethAmount = 1000e18; // Enough ETH for substantial purchase
+        vm.deal(creator, ethAmount);
+        vm.deal(treasury, 0);
+
+        // Buy tokens as creator (should succeed)
+        vm.prank(creator);
+        uint256 tokensBought = launchpad.buyTokens{value: ethAmount}(tokenAddress, 1);
+
+        // Verify tokens were bought
+        assertGt(tokensBought, 0, "Creator should receive tokens");
+        assertEq(MemeToken(tokenAddress).balanceOf(creator), tokensBought, "Creator balance mismatch");
+        
+        // Verify creator bought amount is tracked
+        assertEq(
+            launchpad.creatorBoughtAmount(tokenAddress, creator),
+            tokensBought,
+            "Creator bought amount should be tracked"
+        );
+
+        // Verify creator can still buy more (if within limit)
+        assertLt(tokensBought, creatorMaxBuy, "Tokens bought should be less than max");
+    }
+
+    function testCreatorCannotExceedBuyLimit() public {
+        // Create token as creator
+        vm.prank(creator);
+        address tokenAddress = launchpad.createToken("LimitToken", "LT", "Limit metadata");
+
+        // Calculate creator max buy: 140M tokens
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 bondingMax = (maxSupply * 70) / 100; // 700M tokens
+        uint256 creatorMaxBuy = (bondingMax * 20) / 100; // 140M tokens
+
+        // Give creator a large amount of ETH
+        vm.deal(creator, 500000e18);
+        vm.deal(treasury, 0);
+
+        // Buy tokens in smaller chunks to avoid hitting limit unexpectedly
+        uint256 purchaseCount = 0;
+        uint256 ethPerPurchase = 2000e18; // Smaller purchases
+        
+        // Make purchases and verify limit is never exceeded
+        for (uint256 i = 0; i < 150; i++) {
+            uint256 currentBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            
+            // If we're already at the limit, verify we can't buy more
+            if (currentBought >= creatorMaxBuy) {
+                vm.prank(creator);
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: ethPerPurchase}(tokenAddress, 1);
+                break;
+            }
+            
+            // Calculate remaining capacity - if very small, use tiny purchase amount
+            uint256 remainingCapacity = creatorMaxBuy - currentBought;
+            uint256 purchaseAmount = ethPerPurchase;
+            
+            // Use very small amount when close to limit to avoid exceeding it
+            if (remainingCapacity < 1e18) {
+                purchaseAmount = 1e12; // Very small amount
+            }
+            
+            // Try to buy tokens - if it would exceed limit, it will revert
+            // We handle this by checking the result
+            vm.prank(creator);
+            
+            // Use expectRevert if we're very close to limit
+            if (remainingCapacity < 1e15) {
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+                break;
+            }
+            
+            // Otherwise, try to buy
+            uint256 tokensBought = launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+            
+            // Verify we got tokens
+            assertGt(tokensBought, 0, "Should receive tokens");
+            purchaseCount++;
+            
+            // Verify we haven't exceeded the limit
+            uint256 newTotal = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            assertLe(newTotal, creatorMaxBuy, "Should never exceed creator buy limit");
+            
+            // If we've reached the limit, verify next purchase fails
+            if (newTotal >= creatorMaxBuy) {
+                vm.prank(creator);
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+                break;
+            }
+        }
+        
+        // Verify we made purchases and respected the limit
+        assertGt(purchaseCount, 0, "Should have made some purchases");
+        uint256 finalBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+        assertLe(finalBought, creatorMaxBuy, "Should never exceed limit");
+    }
+
+    function testCreatorBuyLimitTrackedAcrossMultiplePurchases() public {
+        // Create token as creator
+        vm.prank(creator);
+        address tokenAddress = launchpad.createToken("TrackToken", "TT", "Track metadata");
+
+        // Calculate creator max buy: 140M tokens
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 bondingMax = (maxSupply * 70) / 100;
+        uint256 creatorMaxBuy = (bondingMax * 20) / 100;
+
+        // Give creator ETH for multiple purchases
+        vm.deal(creator, 10000e18);
+        vm.deal(treasury, 0);
+
+        uint256 totalBought = 0;
+        uint256 purchaseCount = 5;
+        uint256 ethPerPurchase = 1000e18;
+
+        // Make multiple purchases
+        for (uint256 i = 0; i < purchaseCount; i++) {
+            vm.prank(creator);
+            uint256 tokensBought = launchpad.buyTokens{value: ethPerPurchase}(tokenAddress, 1);
+            totalBought += tokensBought;
+
+            // Verify tracking is cumulative
+            assertEq(
+                launchpad.creatorBoughtAmount(tokenAddress, creator),
+                totalBought,
+                "Creator bought amount should be cumulative"
+            );
+        }
+
+        // Verify total is tracked correctly
+        assertEq(
+            launchpad.creatorBoughtAmount(tokenAddress, creator),
+            totalBought,
+            "Total bought should match tracked amount"
+        );
+
+        // Verify we haven't exceeded the limit yet
+        assertLe(totalBought, creatorMaxBuy, "Total bought should not exceed limit");
+    }
+
+    function testNonCreatorNotAffectedByBuyLimit() public {
+        // Create token as creator
+        vm.prank(creator);
+        address tokenAddress = launchpad.createToken("PublicToken", "PT", "Public metadata");
+
+        address buyer = makeAddr("buyer");
+        uint256 ethAmount = 5000e18;
+        
+        vm.deal(buyer, ethAmount);
+        vm.deal(treasury, 0);
+
+        // Non-creator can buy without limit restrictions
+        vm.prank(buyer);
+        uint256 tokensBought = launchpad.buyTokens{value: ethAmount}(tokenAddress, 1);
+
+        // Verify tokens were bought
+        assertGt(tokensBought, 0, "Buyer should receive tokens");
+        assertEq(MemeToken(tokenAddress).balanceOf(buyer), tokensBought, "Buyer balance mismatch");
+
+        // Verify non-creator's purchases are not tracked in creatorBoughtAmount
+        assertEq(
+            launchpad.creatorBoughtAmount(tokenAddress, buyer),
+            0,
+            "Non-creator purchases should not be tracked in creatorBoughtAmount"
+        );
+
+        // Non-creator can buy again without limit
+        vm.prank(buyer);
+        uint256 tokensBought2 = launchpad.buyTokens{value: ethAmount}(tokenAddress, 1);
+        assertGt(tokensBought2, 0, "Buyer should be able to buy again");
+    }
+
+    function testCreatorBuyLimitBoundary() public {
+        // This test verifies boundary conditions of the creator buy limit
+        // It's similar to testCreatorCannotExceedBuyLimit but focuses on boundary behavior
+        
+        // Create token as creator
+        vm.prank(creator);
+        address tokenAddress = launchpad.createToken("BoundaryToken", "BT", "Boundary metadata");
+
+        // Calculate creator max buy: 140M tokens
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 bondingMax = (maxSupply * 70) / 100;
+        uint256 creatorMaxBuy = (bondingMax * 20) / 100; // 140M tokens
+
+        vm.deal(creator, 500000e18);
+        vm.deal(treasury, 0);
+
+        // Buy tokens in smaller chunks to avoid hitting limit unexpectedly
+        uint256 purchaseCount = 0;
+        uint256 ethPerPurchase = 2000e18; // Smaller purchases
+        
+        // Make purchases and verify limit is never exceeded
+        for (uint256 i = 0; i < 150; i++) {
+            uint256 currentBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            
+            // If we're already at the limit, verify we can't buy more
+            if (currentBought >= creatorMaxBuy) {
+                vm.prank(creator);
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: ethPerPurchase}(tokenAddress, 1);
+                break;
+            }
+            
+            // Calculate remaining capacity - if very small, use tiny purchase amount
+            uint256 remainingCapacity = creatorMaxBuy - currentBought;
+            uint256 purchaseAmount = ethPerPurchase;
+            
+            // Use very small amount when close to limit to avoid exceeding it
+            if (remainingCapacity < 1e18) {
+                purchaseAmount = 1e12; // Very small amount
+            }
+            
+            // Try to buy tokens - if it would exceed limit, it will revert
+            // We handle this by checking the result
+            vm.prank(creator);
+            
+            // Use expectRevert if we're very close to limit
+            if (remainingCapacity < 1e15) {
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+                break;
+            }
+            
+            // Otherwise, try to buy
+            uint256 tokensBought = launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+            
+            // Verify we got tokens
+            assertGt(tokensBought, 0, "Should receive tokens");
+            purchaseCount++;
+            
+            // Verify we haven't exceeded the limit
+            uint256 newTotal = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            assertLe(newTotal, creatorMaxBuy, "Should never exceed creator buy limit");
+            
+            // If we've reached the limit, verify next purchase fails
+            if (newTotal >= creatorMaxBuy) {
+                vm.prank(creator);
+                vm.expectRevert(MemeLaunchpad.CreatorBuyLimitExceeded.selector);
+                launchpad.buyTokens{value: purchaseAmount}(tokenAddress, 1);
+                break;
+            }
+        }
+        
+        // Verify we made purchases and respected the limit
+        assertGt(purchaseCount, 0, "Should have made some purchases");
+        uint256 finalBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+        assertLe(finalBought, creatorMaxBuy, "Should never exceed limit");
+    }
+
+    function testCreatorBuyLimitDifferentTokens() public {
+        // Create two tokens as creator
+        vm.prank(creator);
+        address tokenAddress1 = launchpad.createToken("Token1", "T1", "Metadata1");
+        
+        vm.prank(creator);
+        address tokenAddress2 = launchpad.createToken("Token2", "T2", "Metadata2");
+
+        vm.deal(creator, 10000e18);
+        vm.deal(treasury, 0);
+
+        // Buy tokens from first token
+        vm.prank(creator);
+        uint256 tokens1 = launchpad.buyTokens{value: 1000e18}(tokenAddress1, 1);
+
+        // Buy tokens from second token
+        vm.prank(creator);
+        uint256 tokens2 = launchpad.buyTokens{value: 1000e18}(tokenAddress2, 1);
+
+        // Verify limits are tracked per token
+        assertEq(
+            launchpad.creatorBoughtAmount(tokenAddress1, creator),
+            tokens1,
+            "First token limit should be tracked separately"
+        );
+        assertEq(
+            launchpad.creatorBoughtAmount(tokenAddress2, creator),
+            tokens2,
+            "Second token limit should be tracked separately"
+        );
+
+        // Creator should have separate limits for each token
+        assertGt(tokens1, 0, "Should buy from first token");
+        assertGt(tokens2, 0, "Should buy from second token");
     }
 }

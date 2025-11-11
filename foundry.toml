@@ -1,4 +1,4 @@
-[default]
+[profile.default]
 src = 'src'
 out = 'out'
 libs = ['lib']
@@ -6,5 +6,9 @@ remappings = [
     '@thirdweb-dev/=node_modules/@thirdweb-dev/',
 ]
 
+# Optimizer settings to reduce contract size
+optimizer = true
+optimizer_runs = 1  # Lower runs = smaller bytecode size (prioritizes deployment size over runtime gas)
+via_ir = true  # Enable IR-based code generation for better optimization
 
 # See more config options https://github.com/foundry-rs/foundry/tree/master/config
