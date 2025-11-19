@@ -62,6 +62,12 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         uint256 timestamp
     );
 
+    event TokenUnlocked(
+        address indexed tokenAddress,
+        address indexed creator,
+        uint256 creatorBoughtAmount
+    );
+
     // Custom Errors
     error TokenLaunchCompleted();
     error MustSendETH();
@@ -71,6 +77,7 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     error MustSellTokens();
     error InsufficientCirculatingSupply();
     error CreatorBuyLimitExceeded();
+    error TokenLocked();
 
     // ==================== STRUCTS ====================
 
@@ -101,6 +108,7 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     uint256 public constant FEE_PERCENT = 1; // 1% fee
     uint256 public constant PRICE_STEP_SIZE = 10_000_000 * 1e18; // Price increases every 10M tokens (makes price increase significantly)
     uint256 public constant CREATOR_MAX_BUY_PERCENT = 20; // Creator can buy max 20% of bonding curve supply (140M tokens)
+    uint256 public constant CREATOR_UNLOCK_THRESHOLD_PERCENT = 2; // Creator must buy 2% of max supply to unlock token
     uint256 public constant COMMENT_FEE = 0.025 ether; // Fee to comment on a token
 
     // ==================== STATE VARIABLES ====================
@@ -119,6 +127,9 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     // Track creator purchases from bonding curve per token
     mapping(address => mapping(address => uint256)) public creatorBoughtAmount;
 
+    // Track if a token is unlocked (once unlocked, stays unlocked)
+    mapping(address => bool) public tokenUnlocked;
+
     // Treasury address for fees
     address public treasuryAddress;
 
@@ -129,6 +140,9 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     mapping(address => UserVolume) public userVolumes;
+
+    // Track total ETH traded (TVT) per token
+    mapping(address => uint256) public tokenTotalValueTraded;
 
     // DEX router for migration
     address public dexRouter;
@@ -211,6 +225,13 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         if (token.completed) revert TokenLaunchCompleted();
         if (msg.value == 0) revert MustSendETH();
 
+        // Check if token is locked - only creator can buy if locked
+        if (!tokenUnlocked[tokenAddress]) {
+            if (msg.sender != token.creator) {
+                revert TokenLocked();
+            }
+        }
+
         // Calculate current price using quadratic bonding curve
         uint256 currentPrice = _calculatePrice(token.currentSupply);
 
@@ -229,6 +250,15 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
                 revert CreatorBuyLimitExceeded();
             }
             creatorBoughtAmount[tokenAddress][msg.sender] += tokensBought;
+
+            // Check if creator has reached unlock threshold (2% of max supply)
+            if (!tokenUnlocked[tokenAddress]) {
+                uint256 unlockThreshold = (token.maxSupply * CREATOR_UNLOCK_THRESHOLD_PERCENT) / 100;
+                if (creatorBoughtAmount[tokenAddress][msg.sender] >= unlockThreshold) {
+                    tokenUnlocked[tokenAddress] = true;
+                    emit TokenUnlocked(tokenAddress, msg.sender, creatorBoughtAmount[tokenAddress][msg.sender]);
+                }
+            }
         }
 
         // Calculate fee and update supply
@@ -258,6 +288,9 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         // Track user buy volume (in ETH)
         userVolumes[msg.sender].totalBuyVolume += msg.value;
 
+        // Track total value traded (TVT) for this token (ETH amount after fee)
+        tokenTotalValueTraded[tokenAddress] += (msg.value - fee);
+
         // Emit event with calculated price
         emit TokensBought(tokenAddress, msg.sender, msg.value - fee, tokensBought, currentPrice);
         return tokensBought;
@@ -268,6 +301,7 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     /**
        * @dev Sell tokens to the bonding curve using pump.fun style calculation
        * Note: Users must approve this contract to spend their tokens first
+       * Note: Selling is allowed even when token is locked (creator can sell before reaching 2% unlock threshold)
        */
     function sellTokens(
         address tokenAddress,
@@ -299,6 +333,9 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
 
         // Track user sell volume (in ETH)
         userVolumes[msg.sender].totalSellVolume += netEth;
+
+        // Track total value traded (TVT) for this token (ETH amount after fee)
+        tokenTotalValueTraded[tokenAddress] += netEth;
 
         // Emit event with calculated price
         emit TokensSold(tokenAddress, msg.sender, netEth, tokenAmount, currentPrice);
@@ -404,6 +441,33 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         returns (address[] memory)
     {
         return tokenHolders[tokenAddress];
+    }
+
+    /**
+     * @dev Get the Total Value Traded (TVT) for a specific token
+     * @param tokenAddress The address of the meme token
+     * @return The total ETH value traded for this token (after fees)
+     */
+    function getTokenTVT(address tokenAddress)
+        external
+        view
+        onlyValidToken(tokenAddress)
+        returns (uint256)
+    {
+        return tokenTotalValueTraded[tokenAddress];
+    }
+
+    /**
+     * @dev Get the Total Value Traded (TVT) across all meme tokens on the launchpad
+     * @return The total ETH value traded across all tokens (after fees)
+     */
+    function getTotalTVT() external view returns (uint256) {
+        uint256 total = 0;
+        uint256 tokenCount = allTokens.length;
+        for (uint256 i = 0; i < tokenCount; i++) {
+            total += tokenTotalValueTraded[allTokens[i]];
+        }
+        return total;
     }
     
     // Other view functions removed to reduce contract size - can be computed off-chain from events
