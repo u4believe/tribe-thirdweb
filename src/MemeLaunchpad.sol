@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./MemeToken.sol";
 
+/**
+ * @notice Interface for DEX router to add liquidity
+ * @dev Used for migrating tokens to decentralized exchanges after launch completion
+ */
 interface IDEXRouter {
     function addLiquidityETH(
         address token,
@@ -16,13 +18,37 @@ interface IDEXRouter {
     ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
 }
 
-// ==================== EVENTS ====================
-
 /**
  * @title MemeLaunchpad
- * @dev A bonding curve based token launchpad 
+ * @notice Main contract for creating and managing meme tokens with bonding curve mechanics
+ * @dev Implements a pump.fun-style bonding curve where tokens can be bought/sold before DEX migration
  */
-contract MemeLaunchpad is Ownable, ReentrancyGuard {
+contract MemeLaunchpad {
+    // ==================== ACCESS CONTROL ====================
+    
+    /// @notice Owner address for admin functions
+    address private _owner;
+    
+    /// @notice Restricts function access to contract owner only
+    modifier onlyOwner() {
+        require(msg.sender == _owner, "Not owner");
+        _;
+    }
+    
+    // ==================== REENTRANCY PROTECTION ====================
+    
+    /// @notice Reentrancy guard status (1 = not entered, 2 = entered)
+    uint256 private _status;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    
+    /// @notice Prevents reentrant calls to protected functions
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrant call");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
 
     event TokenCreated(
         address indexed tokenAddress,
@@ -68,124 +94,160 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         uint256 creatorBoughtAmount
     );
 
-    // Custom Errors
-    error TokenLaunchCompleted();
-    error MustSendETH();
-    error NoTokensToBuy();
-    error SlippageTooHigh();
-    error ExceedsMaxSupply();
-    error MustSellTokens();
-    error InsufficientCirculatingSupply();
-    error CreatorBuyLimitExceeded();
-    error TokenLocked();
+    // ==================== CUSTOM ERRORS ====================
+    
+    error TokenLaunchCompleted();           // Token has reached max supply and completed
+    error MustSendETH();                   // No ETH sent with buy transaction
+    error NoTokensToBuy();                 // Calculated token amount is zero
+    error SlippageTooHigh();                // Received tokens less than minimum expected
+    error ExceedsMaxSupply();               // Purchase would exceed bonding curve max supply
+    error MustSellTokens();                 // No tokens specified to sell
+    error InsufficientCirculatingSupply();  // Not enough circulating supply to sell
+    error CreatorBuyLimitExceeded();       // Creator exceeded their buy limit (20% of bonding curve)
+    error TokenLocked();                    // Token is locked until creator buys 2% of max supply
 
     // ==================== STRUCTS ====================
-
+    
+    /// @notice Stores information about each created token
     struct TokenInfo {
-        string name;
-        string symbol;
-        string metadata;
-        address creator;
-        uint256 heldTokens; // Amount of tokens held in the contract
-        uint256 maxSupply; // Maximum token supply before completion
-        uint256 currentSupply; // Current token supply
-        bool completed; // Whether the token has reached completion
-        uint256 creationTime;
+        string name;              // Token name
+        string symbol;            // Token symbol
+        string metadata;          // Token metadata/description
+        address creator;          // Address of token creator
+        uint256 heldTokens;       // Tokens held by contract (30% of max supply)
+        uint256 maxSupply;        // Maximum token supply (1 billion)
+        uint256 currentSupply;    // Current circulating supply from bonding curve
+        bool completed;           // Whether token launch has completed
+        uint256 creationTime;     // Timestamp when token was created
     }
 
+    /// @notice Stores comment information for tokens
     struct Comment {
-        address commenter;
-        string text;
-        uint256 timestamp;
+        address commenter;        // Address of user who commented
+        string text;              // Comment text
+        uint256 timestamp;        // When comment was made
     }
 
     // ==================== CONSTANTS ====================
-
-    uint256 public constant BONDING_CURVE_PERCENT = 70; // 70% for bonding curve
-    uint256 public constant HELD_PERCENT = 30; // 30% held in memelaunchpad
-    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18; // 1B tokens max
-    uint256 public constant INITIAL_PRICE = 0.0001533e18; // Initial price in ETH
-    uint256 public constant FEE_PERCENT = 1; // 1% fee
-    uint256 public constant PRICE_STEP_SIZE = 10_000_000 * 1e18; // Price increases every 10M tokens (makes price increase significantly)
-    uint256 public constant CREATOR_MAX_BUY_PERCENT = 20; // Creator can buy max 20% of bonding curve supply (140M tokens)
-    uint256 public constant CREATOR_UNLOCK_THRESHOLD_PERCENT = 2; // Creator must buy 2% of max supply to unlock token
-    uint256 public constant COMMENT_FEE = 0.025 ether; // Fee to comment on a token
-
+    
+    uint256 public constant BONDING_CURVE_PERCENT = 70;              // 70% of supply for bonding curve
+    uint256 public constant HELD_PERCENT = 30;                      // 30% of supply held by contract
+    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18;      // 1 billion tokens max supply
+    uint256 public constant INITIAL_PRICE = 0.0001533e18;           // Initial price per token in ETH
+    uint256 public constant FEE_PERCENT = 1;                         // 1% fee on buy/sell transactions
+    uint256 public constant PRICE_STEP_SIZE = 10_000_000 * 1e18;    // Price increases every 10M tokens
+    uint256 public constant CREATOR_MAX_BUY_PERCENT = 20;           // Creator can buy max 20% of bonding curve
+    uint256 public constant CREATOR_UNLOCK_THRESHOLD_PERCENT = 2;   // Creator must buy 2% to unlock token
+    uint256 public constant COMMENT_FEE = 0.025 ether;              // Fee required to comment on tokens 
+    
     // ==================== STATE VARIABLES ====================
     
+    /// @notice Maps token address to its information
     mapping(address => TokenInfo) public tokenInfo;
+    
+    /// @notice Tracks which token addresses are valid
     mapping(address => bool) public isValidToken;
+    
+    /// @notice Array of all created token addresses
     address[] public allTokens;
 
-    // Track unique addresses that have ever purchased from the bonding curve per token
+    /// @notice Tracks unique addresses that have purchased tokens per token
     mapping(address => address[]) private tokenHolders;
+    
+    /// @notice Quick lookup to check if address has purchased from bonding curve
     mapping(address => mapping(address => bool)) private isTokenHolder;
     
-     // Track comments per token
+    /// @notice Stores comments for each token
     mapping(address => Comment[]) private tokenComments;
     
-    // Track creator purchases from bonding curve per token
+    /// @notice Tracks how much each creator has bought from bonding curve
     mapping(address => mapping(address => uint256)) public creatorBoughtAmount;
 
-    // Track if a token is unlocked (once unlocked, stays unlocked)
+    /// @notice Tracks if a token is unlocked (once unlocked, stays unlocked)
     mapping(address => bool) public tokenUnlocked;
 
-    // Treasury address for fees
+    /// @notice Treasury address that receives fees
     address public treasuryAddress;
 
-    // Track total buy and sell volume (in ETH) per user
+    /// @notice Tracks user trading volumes
     struct UserVolume {
-        uint256 totalBuyVolume;
-        uint256 totalSellVolume;
+        uint256 totalBuyVolume;   // Total ETH spent buying tokens
+        uint256 totalSellVolume;  // Total ETH received selling tokens
     }
 
+    /// @notice Maps user address to their trading volume
     mapping(address => UserVolume) public userVolumes;
 
-    // Track total ETH traded (TVT) per token
+    /// @notice Tracks total value traded (TVT) per token in ETH
     mapping(address => uint256) public tokenTotalValueTraded;
 
-    // DEX router for migration
+    /// @notice DEX router address for liquidity migration
     address public dexRouter;
 
     // ==================== MODIFIERS ====================
-
-    // Modifiers
+    
+    /// @notice Validates that the token address is a valid token created through this launchpad
     modifier onlyValidToken(address tokenAddress) {
-        require(isValidToken[tokenAddress], "Invalid token");
+        require(isValidToken[tokenAddress], "Invalid");
         _;
     }
 
     // ==================== CONSTRUCTOR ====================
-
-    constructor(address _treasuryAddress, address _dexRouter) Ownable(msg.sender) {
+    
+    /**
+     * @notice Initializes the MemeLaunchpad contract
+     * @param _treasuryAddress Address that will receive all fees
+     * @param _dexRouter Address of DEX router for liquidity migration
+     */
+    constructor(address _treasuryAddress, address _dexRouter) {
+        _owner = msg.sender;
+        _status = _NOT_ENTERED;
         treasuryAddress = _treasuryAddress;
         dexRouter = _dexRouter;
     }
+    
+    // ==================== OWNER FUNCTIONS ====================
+    
+    /// @notice Returns the current owner address
+    function owner() external view returns (address) {
+        return _owner;
+    }
+    
+    /// @notice Transfers ownership to a new address
+    /// @param newOwner Address of the new owner
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Invalid owner");
+        _owner = newOwner;
+    }
 
     // ==================== TOKEN CREATION ====================
-
+    
     /**
-      * @dev Create a new meme token with bonding curve
-      */
+     * @notice Creates a new meme token with bonding curve mechanics
+     * @dev Creates token with 70% for bonding curve, 30% held by contract
+     * @param name Token name
+     * @param symbol Token symbol
+     * @param metadata Token description/metadata
+     * @return Address of the newly created token
+     */
     function createToken(
         string memory name,
         string memory symbol,
         string memory metadata
     ) external returns (address) {
-        require(bytes(name).length > 0, "Name required");
-        require(bytes(symbol).length > 0, "Symbol required");
+        require(bytes(name).length > 0 && bytes(symbol).length > 0, "Invalid");
         uint256 totalSupply = MAX_SUPPLY;
 
-        // Create the token contract
+        // Deploy new MemeToken contract
         MemeToken token = new MemeToken(name, symbol, totalSupply);
 
-        // Set launchpad for minting permissions
+        // Set this contract as the launchpad (allows minting)
         token.setLaunchpad(address(this));
 
-        // Calculate allocations (70% bonding curve, 30% memelaunchpad, 0% creator)
+        // Calculate 30% of supply to be held by contract
         uint256 heldAmount = (totalSupply * HELD_PERCENT) / 100;
 
-        // Initialize token info
+        // Store token information
         tokenInfo[address(token)] = TokenInfo({
             name: name,
             symbol: symbol,
@@ -198,11 +260,12 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
             creationTime: block.timestamp
         });
 
+        // Mark token as valid and add to list
         isValidToken[address(token)] = true;
         allTokens.push(address(token));
 
-        // Mint allocations (no creator tokens)
-        token.mint(address(this), heldAmount); // 30% held in memelaunchpad
+        // Mint the 30% held tokens to this contract
+        token.mint(address(this), heldAmount); 
 
         emit TokenCreated(address(token), name, symbol, metadata, msg.sender, 0);
 
@@ -210,10 +273,14 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     // ==================== TOKEN BUYING ====================
-
+    
     /**
-      * @dev Buy tokens from the bonding curve using pump.fun style calculation
-      */
+     * @notice Buy tokens from the bonding curve
+     * @dev Uses quadratic bonding curve pricing. Token must be unlocked unless buyer is creator.
+     * @param tokenAddress Address of the token to buy
+     * @param minTokensOut Minimum tokens expected (slippage protection)
+     * @return tokensBought Amount of tokens purchased
+     */
     function buyTokens(address tokenAddress, uint256 minTokensOut)
         external
         payable
@@ -240,10 +307,11 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         if (tokensBought == 0) revert NoTokensToBuy();
         if (tokensBought < minTokensOut) revert SlippageTooHigh();
 
+        // Check if purchase would exceed bonding curve max supply (70% of total)
         uint256 bondingMax = (token.maxSupply * BONDING_CURVE_PERCENT) / 100;
         if (token.currentSupply + tokensBought > bondingMax) revert ExceedsMaxSupply();
 
-        // Check creator buy limit (20% of bonding curve supply = 140M tokens)
+        // Handle creator-specific logic (buy limits and unlock mechanism)
         if (msg.sender == token.creator) {
             uint256 creatorMaxBuy = (bondingMax * CREATOR_MAX_BUY_PERCENT) / 100;
             if (creatorBoughtAmount[tokenAddress][msg.sender] + tokensBought > creatorMaxBuy) {
@@ -265,7 +333,7 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         uint256 fee = (msg.value * FEE_PERCENT) / 100;
         token.currentSupply += tokensBought;
 
-        // Check if token should be completed (when circulating supply reaches bonding max)
+        // Check if token should be completed (reached bonding curve max)
         if (token.currentSupply >= bondingMax && !token.completed) {
             token.completed = true;
             uint256 finalPrice = _calculatePrice(token.currentSupply);
@@ -276,7 +344,7 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         // Mint tokens to buyer
         MemeToken(tokenAddress).mint(msg.sender, tokensBought);
 
-        // Track unique holders that have ever bought from the bonding curve
+        // Track unique holders
         if (!isTokenHolder[tokenAddress][msg.sender]) {
             isTokenHolder[tokenAddress][msg.sender] = true;
             tokenHolders[tokenAddress].push(msg.sender);
@@ -285,24 +353,23 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         // Send fee to treasury
         payable(treasuryAddress).transfer(fee);
 
-        // Track user buy volume (in ETH)
+        // Update volume tracking
         userVolumes[msg.sender].totalBuyVolume += msg.value;
-
-        // Track total value traded (TVT) for this token (ETH amount after fee)
         tokenTotalValueTraded[tokenAddress] += (msg.value - fee);
 
-        // Emit event with calculated price
         emit TokensBought(tokenAddress, msg.sender, msg.value - fee, tokensBought, currentPrice);
         return tokensBought;
     }
 
     // ==================== TOKEN SELLING ====================
-
+    
     /**
-       * @dev Sell tokens to the bonding curve using pump.fun style calculation
-       * Note: Users must approve this contract to spend their tokens first
-       * Note: Selling is allowed even when token is locked (creator can sell before reaching 2% unlock threshold)
-       */
+     * @notice Sell tokens back to the bonding curve
+     * @dev User must approve this contract to spend their tokens first
+     * @param tokenAddress Address of the token to sell
+     * @param tokenAmount Amount of tokens to sell
+     * @return ethReceived Net ETH received after fees
+     */
     function sellTokens(
         address tokenAddress,
         uint256 tokenAmount
@@ -311,43 +378,42 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         if (token.completed) revert TokenLaunchCompleted();
         if (tokenAmount == 0) revert MustSellTokens();
 
-        // Calculate current price using quadratic bonding curve
+        // Calculate current price and ETH to receive
         uint256 currentPrice = _calculatePrice(token.currentSupply);
-
-        // Calculate ETH to receive (before burning) and cap to available balance
         uint256 calculatedEth = (tokenAmount * currentPrice) / 1e18;
+        
+        // Cap to available contract balance (safety check)
         ethReceived = calculatedEth > address(this).balance ? address(this).balance : calculatedEth;
 
-        // Check if sufficient circulating supply
+        // Ensure sufficient circulating supply
         if (token.currentSupply <= tokenAmount) revert InsufficientCirculatingSupply();
 
         // Update supply and burn tokens
         token.currentSupply -= tokenAmount;
         MemeToken(tokenAddress).burnFrom(msg.sender, tokenAmount);
 
-        // Calculate fee and send ETH
+        // Calculate fee and transfer ETH
         uint256 fee = (ethReceived * FEE_PERCENT) / 100;
         uint256 netEth = ethReceived - fee;
         payable(msg.sender).transfer(netEth);
         payable(treasuryAddress).transfer(fee);
 
-        // Track user sell volume (in ETH)
+        // Update volume tracking
         userVolumes[msg.sender].totalSellVolume += netEth;
-
-        // Track total value traded (TVT) for this token (ETH amount after fee)
         tokenTotalValueTraded[tokenAddress] += netEth;
 
-        // Emit event with calculated price
         emit TokensSold(tokenAddress, msg.sender, netEth, tokenAmount, currentPrice);
         return netEth;
     }
 
     // ==================== PRICING ====================
-
+    
     /**
-      * @dev Calculate price based on current supply using quadratic bonding curve
-      * Price formula: price = INITIAL_PRICE * (1 + (currentSupply / PRICE_STEP_SIZE)^2)
-      */
+     * @notice Calculates the current price using quadratic bonding curve
+     * @dev Price increases quadratically based on supply: price = initialPrice * (1 + (supply/stepSize)^2)
+     * @param currentSupply Current circulating supply of tokens
+     * @return Current price per token in ETH
+     */
     function _calculatePrice(uint256 currentSupply) internal pure returns (uint256) {
         if (currentSupply == 0) {
             return INITIAL_PRICE;
@@ -357,24 +423,32 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     /**
-      * @dev Get current price of a token based on aggressive quadratic bonding curve
-      */
+     * @notice Get the current price for a token
+     * @param tokenAddress Address of the token
+     * @return Current price per token in ETH
+     */
     function getCurrentPrice(address tokenAddress) public view onlyValidToken(tokenAddress) returns (uint256) {
         return _calculatePrice(tokenInfo[tokenAddress].currentSupply);
     }
 
     // ==================== UTILITY FUNCTIONS ====================
-
+    
     /**
-     * @dev Get token information
+     * @notice Get token information
+     * @param tokenAddress Address of the token
+     * @return TokenInfo struct containing all token details
      */
     function getTokenInfo(address tokenAddress) external view returns (TokenInfo memory) {
         return tokenInfo[tokenAddress];
     }
 
+    // ==================== COMMENT SYSTEM ====================
+    
     /**
-     * @dev Add a comment on a specific meme token.
-     * Requires paying the fixed COMMENT_FEE, which is forwarded to the treasury.
+     * @notice Add a comment to a token (requires fee)
+     * @dev Frontend should automatically include COMMENT_FEE in transaction value
+     * @param tokenAddress Address of the token to comment on
+     * @param commentText The comment text
      */
     function addComment(address tokenAddress, string calldata commentText)
         external
@@ -382,9 +456,10 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         nonReentrant
         onlyValidToken(tokenAddress)
     {
-        require(msg.value == COMMENT_FEE, "Incorrect comment fee");
-        require(bytes(commentText).length > 0, "Comment required");
+        require(bytes(commentText).length > 0, "Invalid comment");
+        require(msg.value >= COMMENT_FEE, "Insufficient fee");
 
+        // Store comment
         tokenComments[tokenAddress].push(
             Comment({
                 commenter: msg.sender,
@@ -393,15 +468,21 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
             })
         );
 
-        // Forward fee to treasury
-        payable(treasuryAddress).transfer(msg.value);
+        // Automatically charge exactly COMMENT_FEE and refund any excess
+        payable(treasuryAddress).transfer(COMMENT_FEE);
+        
+        // Refund excess if user sent more than required
+        if (msg.value > COMMENT_FEE) {
+            payable(msg.sender).transfer(msg.value - COMMENT_FEE);
+        }
 
         emit TokenCommented(tokenAddress, msg.sender, commentText, block.timestamp);
     }
 
     /**
-     * @dev Get all comments for a specific meme token.
-     * NOTE: This returns all stored comments on-chain and may become large over time.
+     * @notice Get all comments for a token
+     * @param tokenAddress Address of the token
+     * @return Array of Comment structs
      */
     function getComments(address tokenAddress)
         external
@@ -413,26 +494,28 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Get user volume statistics (total ETH spent buying / received selling)
+     * @notice Get user's trading volume
+     * @param user Address of the user
+     * @return buyVolume Total ETH spent buying tokens
+     * @return sellVolume Total ETH received selling tokens
      */
     function getUserVolume(address user) external view returns (uint256 buyVolume, uint256 sellVolume) {
-        UserVolume memory volume = userVolumes[user];
+        UserVolume storage volume = userVolumes[user];
         return (volume.totalBuyVolume, volume.totalSellVolume);
     }
 
     /**
-     * @dev Get all tokens (required by tests)
+     * @notice Get all created token addresses
+     * @return Array of all token addresses
      */
     function getAllTokens() external view returns (address[] memory) {
         return allTokens;
     }
 
     /**
-     * @dev Get all addresses that have ever bought from the bonding curve for a token
-     * NOTE: This returns addresses that have interacted with the launchpad's bonding curve.
-     * It does not guarantee that each address currently holds a non-zero token balance,
-     * nor does it include addresses that only acquired tokens via peer-to-peer transfers
-     * or on external DEXes after migration.
+     * @notice Get all addresses that have purchased from bonding curve
+     * @param tokenAddress Address of the token
+     * @return Array of holder addresses
      */
     function getTokenHolders(address tokenAddress)
         external
@@ -444,9 +527,9 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Get the Total Value Traded (TVT) for a specific token
-     * @param tokenAddress The address of the meme token
-     * @return The total ETH value traded for this token (after fees)
+     * @notice Get total value traded (TVT) for a specific token
+     * @param tokenAddress Address of the token
+     * @return Total ETH traded for this token
      */
     function getTokenTVT(address tokenAddress)
         external
@@ -458,75 +541,76 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Get the Total Value Traded (TVT) across all meme tokens on the launchpad
-     * @return The total ETH value traded across all tokens (after fees)
+     * @notice Get total value traded across all tokens
+     * @return total Total ETH traded across all tokens
      */
-    function getTotalTVT() external view returns (uint256) {
-        uint256 total = 0;
+    function getTotalTVT() external view returns (uint256 total) {
         uint256 tokenCount = allTokens.length;
         for (uint256 i = 0; i < tokenCount; i++) {
             total += tokenTotalValueTraded[allTokens[i]];
         }
-        return total;
     }
-    
-    // Other view functions removed to reduce contract size - can be computed off-chain from events
-
-    // ==================== MIGRATION ====================
 
     /**
-       * @dev Get held tokens for a token (required by DEXMigrator)
-       */
+     * @notice Get held tokens amount for a token
+     * @param tokenAddress Address of the token
+     * @return Amount of tokens held by contract
+     */
     function getHeldTokens(address tokenAddress) external view onlyValidToken(tokenAddress) returns (uint256) {
         return tokenInfo[tokenAddress].heldTokens;
     }
 
+    // ==================== ADMIN FUNCTIONS ====================
+    
     /**
-       * @dev Approve DEX router to spend tokens (required by DEXMigrator)
-       */
+     * @notice Approve router to spend tokens (for DEX migration)
+     * @param tokenAddress Address of the token
+     * @param router Address of the DEX router
+     * @param amount Amount to approve
+     */
     function approveRouter(address tokenAddress, address router, uint256 amount) external onlyOwner onlyValidToken(tokenAddress) {
         MemeToken(tokenAddress).approve(router, amount);
     }
 
     /**
-       * @dev Set held tokens (required by DEXMigrator)
-       */
+     * @notice Set held tokens amount (admin function)
+     * @param tokenAddress Address of the token
+     * @param amount New held tokens amount
+     */
     function setHeldTokens(address tokenAddress, uint256 amount) external onlyOwner onlyValidToken(tokenAddress) {
         tokenInfo[tokenAddress].heldTokens = amount;
     }
 
+    // ==================== TOKEN COMPLETION & MIGRATION ====================
+    
     /**
-       * @dev Finalize token completion: burn leftover bonding curve tokens and migrate liquidity to DEX
-       * Only MemeLaunchpad contract can call this (internal function)
-       * This function:
-       * 1. Burns any leftover tokens the contract holds beyond what's needed for DEX migration
-       * 2. Migrates liquidity (heldTokens + ETH) to DEX
-       * 3. Ensures trading on bonding curve has stopped (token.completed = true)
-       */
+     * @notice Finalizes token completion: burns excess tokens and migrates to DEX
+     * @dev Called automatically when bonding curve reaches max or manually by owner
+     * @param tokenAddress Address of the token to finalize
+     */
     function _finalizeTokenCompletion(address tokenAddress) internal {
         TokenInfo storage token = tokenInfo[tokenAddress];
         MemeToken tokenContract = MemeToken(tokenAddress);
         
-        // Get contract's token balance
+        // Get contract's token balance and expected held amount
         uint256 contractBalance = tokenContract.balanceOf(address(this));
         uint256 heldTokens = token.heldTokens;
         
-        // Burn any excess tokens the contract holds beyond heldTokens
-        // This represents any leftover tokens that shouldn't be in the bonding curve
-        // heldTokens are reserved for DEX migration, anything beyond that should be burned
+        // Burn any excess tokens beyond the held amount
         if (contractBalance > heldTokens) {
             uint256 excessTokens = contractBalance - heldTokens;
             tokenContract.burn(excessTokens);
         }
         
-        // Migrate liquidity to DEX (only MemeLaunchpad can do this via internal call)
+        // Migrate liquidity to DEX
         _migrateToDEX(tokenAddress);
     }
 
     /**
-       * @dev Migrate liquidity to DEX
-       * Only callable internally by MemeLaunchpad contract
-       */
+     * @notice Migrates token liquidity to a DEX (Uniswap, etc.)
+     * @dev Adds liquidity using held tokens and accumulated ETH
+     * @param tokenAddress Address of the token to migrate
+     */
     function _migrateToDEX(address tokenAddress) internal {
         TokenInfo storage token = tokenInfo[tokenAddress];
         uint256 heldAmount = token.heldTokens;
@@ -534,42 +618,37 @@ contract MemeLaunchpad is Ownable, ReentrancyGuard {
         require(heldAmount > 0 && ethAmount > 0, "No liquidity to migrate");
         require(dexRouter != address(0), "DEX router not set");
 
-        // Approve the router to spend the tokens
+        // Approve router to spend tokens
         MemeToken(tokenAddress).approve(dexRouter, heldAmount);
 
         // Add liquidity to DEX
         IDEXRouter(dexRouter).addLiquidityETH{value: ethAmount}(
             tokenAddress,
             heldAmount,
-            heldAmount,
-            ethAmount,
-            address(this),
+            heldAmount,      // Min tokens (slippage protection)
+            ethAmount,       // Min ETH (slippage protection)
+            address(this),  // LP tokens go to this contract
             block.timestamp
         );
 
-        // Set heldTokens to 0
+        // Mark held tokens as migrated
         token.heldTokens = 0;
     }
 
-    // ==================== ADMIN FUNCTIONS ====================
-
     /**
-       * @dev Complete token launch early (only owner)
-       * This stops all trading on the bonding curve and migrates liquidity to DEX
-       */
+     * @notice Manually complete a token launch (owner only)
+     * @dev Allows owner to force completion before reaching max supply
+     * @param tokenAddress Address of the token to complete
+     */
     function completeTokenLaunch(address tokenAddress) external onlyOwner onlyValidToken(tokenAddress) {
         TokenInfo storage token = tokenInfo[tokenAddress];
-        require(!token.completed, "Already completed");
+        require(!token.completed, "Completed");
 
-        // Mark as completed first to stop trading
         token.completed = true;
         
-        // Finalize completion: burn leftover tokens and migrate liquidity
         uint256 finalPrice = _calculatePrice(token.currentSupply);
         _finalizeTokenCompletion(tokenAddress);
         emit TokenCompleted(tokenAddress, token.currentSupply, finalPrice);
     }
-
-    // Removed withdrawRemainingBalance - all ETH should be migrated to DEX on completion
 
 }

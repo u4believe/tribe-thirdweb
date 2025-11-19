@@ -100,7 +100,7 @@ contract MemeLaunchpadTest is Test {
         string memory symbol = "TEST";
         string memory metadata = "Test metadata";
 
-        vm.expectRevert("Name required");
+        vm.expectRevert("Invalid");
         launchpad.createToken(name, symbol, metadata);
     }
 
@@ -109,7 +109,7 @@ contract MemeLaunchpadTest is Test {
         string memory symbol = "";
         string memory metadata = "Test metadata";
 
-        vm.expectRevert("Symbol required");
+        vm.expectRevert("Invalid");
         launchpad.createToken(name, symbol, metadata);
     }
 
@@ -231,7 +231,7 @@ contract MemeLaunchpadTest is Test {
         address nonOwner = makeAddr("nonOwner");
 
         vm.prank(nonOwner);
-        vm.expectRevert(abi.encodeWithSelector(0x118cdaa7, nonOwner));
+        vm.expectRevert("Not owner");
         launchpad.completeTokenLaunch(tokenAddress);
     }
 

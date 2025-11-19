@@ -105,7 +105,14 @@ contract SellTokenTest is Test {
         // Do not approve
 
         vm.prank(seller);
-        vm.expectRevert(abi.encodeWithSignature("ERC20InsufficientAllowance(address,uint256,uint256)", address(launchpad), 0, sellAmount));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                0xfb8f41b2, // ERC20InsufficientAllowance selector
+                address(launchpad),
+                0,
+                sellAmount
+            )
+        );
         launchpad.sellTokens(tokenAddress, sellAmount);
     }
 
