@@ -159,7 +159,7 @@ contract MemeLaunchpadTest is Test {
         assertEq(MemeToken(tokenAddress).balanceOf(buyer), tokens);
         assertEq(launchpad.getTokenInfo(tokenAddress).currentSupply, supplyBefore + tokens);
         assertFalse(launchpad.getTokenInfo(tokenAddress).completed);
-        assertEq(treasury.balance, 0.01e18, "Treasury should receive 1% fee");
+        assertEq(treasury.balance, 0.02e18, "Treasury should receive 2% fee");
         assertGt(launchpad.getCurrentPrice(tokenAddress), 0.0001533e18, "Price should increase");
     }
 

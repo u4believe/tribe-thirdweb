@@ -134,7 +134,7 @@ contract MemeLaunchpad {
     uint256 public constant HELD_PERCENT = 30;                      // 30% of supply held by contract
     uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18;      // 1 billion tokens max supply
     uint256 public constant INITIAL_PRICE = 0.0001533e18;           // Initial price per token in ETH
-    uint256 public constant FEE_PERCENT = 1;                         // 1% fee on buy/sell transactions
+    uint256 public constant FEE_PERCENT = 2;                         // 2% fee on buy/sell transactions
     uint256 public constant PRICE_STEP_SIZE = 10_000_000 * 1e18;    // Price increases every 10M tokens
     uint256 public constant CREATOR_MAX_BUY_PERCENT = 20;           // Creator can buy max 20% of bonding curve
     uint256 public constant CREATOR_UNLOCK_THRESHOLD_PERCENT = 2;   // Creator must buy 2% to unlock token
@@ -445,8 +445,8 @@ contract MemeLaunchpad {
     // ==================== COMMENT SYSTEM ====================
     
     /**
-     * @notice Add a comment to a token (requires fee)
-     * @dev Frontend should automatically include COMMENT_FEE in transaction value
+     * @notice Add a comment to a token (requires exact fee)
+     * @dev User must send exactly COMMENT_FEE with the transaction
      * @param tokenAddress Address of the token to comment on
      * @param commentText The comment text
      */
@@ -457,7 +457,7 @@ contract MemeLaunchpad {
         onlyValidToken(tokenAddress)
     {
         require(bytes(commentText).length > 0, "Invalid comment");
-        require(msg.value >= COMMENT_FEE, "Insufficient fee");
+        require(msg.value == COMMENT_FEE, "Exact fee required");
 
         // Store comment
         tokenComments[tokenAddress].push(
@@ -468,13 +468,8 @@ contract MemeLaunchpad {
             })
         );
 
-        // Automatically charge exactly COMMENT_FEE and refund any excess
+        // Transfer fee to treasury
         payable(treasuryAddress).transfer(COMMENT_FEE);
-        
-        // Refund excess if user sent more than required
-        if (msg.value > COMMENT_FEE) {
-            payable(msg.sender).transfer(msg.value - COMMENT_FEE);
-        }
 
         emit TokenCommented(tokenAddress, msg.sender, commentText, block.timestamp);
     }
@@ -572,60 +567,44 @@ contract MemeLaunchpad {
         MemeToken(tokenAddress).approve(router, amount);
     }
 
-    /**
-     * @notice Set held tokens amount (admin function)
-     * @param tokenAddress Address of the token
-     * @param amount New held tokens amount
-     */
-    function setHeldTokens(address tokenAddress, uint256 amount) external onlyOwner onlyValidToken(tokenAddress) {
-        tokenInfo[tokenAddress].heldTokens = amount;
-    }
 
     // ==================== TOKEN COMPLETION & MIGRATION ====================
     
     /**
-     * @notice Finalizes token completion: burns excess tokens and migrates to DEX
+     * @notice Finalizes token completion: migrates all liquidity to DEX
      * @dev Called automatically when bonding curve reaches max or manually by owner
+     *      Migrates all held tokens (30% of max supply) and all accumulated ETH to DEX
      * @param tokenAddress Address of the token to finalize
      */
     function _finalizeTokenCompletion(address tokenAddress) internal {
-        TokenInfo storage token = tokenInfo[tokenAddress];
-        MemeToken tokenContract = MemeToken(tokenAddress);
-        
-        // Get contract's token balance and expected held amount
-        uint256 contractBalance = tokenContract.balanceOf(address(this));
-        uint256 heldTokens = token.heldTokens;
-        
-        // Burn any excess tokens beyond the held amount
-        if (contractBalance > heldTokens) {
-            uint256 excessTokens = contractBalance - heldTokens;
-            tokenContract.burn(excessTokens);
-        }
-        
-        // Migrate liquidity to DEX
+        // Migrate all liquidity to DEX (all held tokens + all ETH balance)
         _migrateToDEX(tokenAddress);
     }
 
     /**
      * @notice Migrates token liquidity to a DEX (Uniswap, etc.)
-     * @dev Adds liquidity using held tokens and accumulated ETH
+     * @dev Adds liquidity using all held tokens (30% of max supply) and all accumulated ETH
      * @param tokenAddress Address of the token to migrate
      */
     function _migrateToDEX(address tokenAddress) internal {
         TokenInfo storage token = tokenInfo[tokenAddress];
-        uint256 heldAmount = token.heldTokens;
+        MemeToken tokenContract = MemeToken(tokenAddress);
+        
+        // Get all tokens held by contract (should be 30% of max supply)
+        uint256 tokenAmount = tokenContract.balanceOf(address(this));
         uint256 ethAmount = address(this).balance;
-        require(heldAmount > 0 && ethAmount > 0, "No liquidity to migrate");
+        
+        require(tokenAmount > 0 && ethAmount > 0, "No liquidity to migrate");
         require(dexRouter != address(0), "DEX router not set");
 
-        // Approve router to spend tokens
-        MemeToken(tokenAddress).approve(dexRouter, heldAmount);
+        // Approve router to spend all tokens
+        tokenContract.approve(dexRouter, tokenAmount);
 
-        // Add liquidity to DEX
+        // Add liquidity to DEX with all tokens and all ETH
         IDEXRouter(dexRouter).addLiquidityETH{value: ethAmount}(
             tokenAddress,
-            heldAmount,
-            heldAmount,      // Min tokens (slippage protection)
+            tokenAmount,
+            tokenAmount,     // Min tokens (slippage protection)
             ethAmount,       // Min ETH (slippage protection)
             address(this),  // LP tokens go to this contract
             block.timestamp

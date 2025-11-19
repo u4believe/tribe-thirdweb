@@ -30,7 +30,6 @@ contract DEXMigrator {
             block.timestamp
         );
 
-        // Set heldTokens to 0
-        MemeLaunchpad(launchpadAddress).setHeldTokens(tokenAddress, 0);
+        // Note: heldTokens is automatically set to 0 in the MemeLaunchpad's _migrateToDEX function
     }
 }
