@@ -17,6 +17,36 @@ contract MemeLaunchpadTest is Test {
         launchpad = new MemeLaunchpad(treasury, dexRouter);
     }
 
+    // Helper function to unlock a token by having the creator buy enough tokens
+    // Unlock threshold is 2% of max supply = 20M tokens
+    // At initial price of 0.0001533e18, we need ~3066 ETH, but we'll use more to account for price increases
+    function unlockToken(address tokenAddress) internal {
+        // Check if already unlocked
+        if (launchpad.tokenUnlocked(tokenAddress)) {
+            return;
+        }
+        
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 unlockThreshold = (maxSupply * 2) / 100; // 20M tokens
+        
+        // Buy tokens until unlocked
+        uint256 maxIterations = 100; // Safety limit
+        for (uint256 i = 0; i < maxIterations && !launchpad.tokenUnlocked(tokenAddress); i++) {
+            uint256 currentBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            if (currentBought >= unlockThreshold) {
+                break;
+            }
+            
+            // Give creator enough ETH for this purchase (refresh balance each iteration)
+            uint256 ethAmount = 5000e18;
+            vm.deal(creator, ethAmount);
+            
+            // Buy with a reasonable amount of ETH
+            vm.prank(creator);
+            launchpad.buyTokens{value: ethAmount}(tokenAddress, 1);
+        }
+    }
+
     function testCreateToken() public {
         string memory name = "TestToken";
         string memory symbol = "TEST";
@@ -104,7 +134,14 @@ contract MemeLaunchpadTest is Test {
 
     function testBuyTokens() public {
         // Create a token
+        vm.prank(creator);
         address tokenAddress = launchpad.createToken("BuyToken", "BT", "Buy metadata");
+
+        // Unlock the token first
+        unlockToken(tokenAddress);
+
+        // Get the current supply after unlocking (creator has already bought tokens)
+        uint256 supplyBefore = launchpad.getTokenInfo(tokenAddress).currentSupply;
 
         address buyer = makeAddr("buyer");
         uint256 ethAmount = 1e18;
@@ -120,7 +157,7 @@ contract MemeLaunchpadTest is Test {
         // Verify basic functionality
         assertGt(tokens, 0, "Should receive tokens");
         assertEq(MemeToken(tokenAddress).balanceOf(buyer), tokens);
-        assertEq(launchpad.getTokenInfo(tokenAddress).currentSupply, tokens);
+        assertEq(launchpad.getTokenInfo(tokenAddress).currentSupply, supplyBefore + tokens);
         assertFalse(launchpad.getTokenInfo(tokenAddress).completed);
         assertEq(treasury.balance, 0.01e18, "Treasury should receive 1% fee");
         assertGt(launchpad.getCurrentPrice(tokenAddress), 0.0001533e18, "Price should increase");
@@ -137,7 +174,12 @@ contract MemeLaunchpadTest is Test {
     }
 
     function testBuyTokensSlippageTooHigh() public {
+        vm.prank(creator);
         address tokenAddress = launchpad.createToken("SlipToken", "ST", "Slip metadata");
+        
+        // Unlock the token first
+        unlockToken(tokenAddress);
+        
         address buyer = makeAddr("buyer");
         uint256 ethAmount = 1e18;
 
@@ -152,7 +194,11 @@ contract MemeLaunchpadTest is Test {
 
     function testCompleteTokenLaunch() public {
         // Create a token
+        vm.prank(creator);
         address tokenAddress = launchpad.createToken("CompleteToken", "CT", "Complete metadata");
+
+        // Unlock the token first
+        unlockToken(tokenAddress);
 
         // Buy some tokens to have ETH in the contract
         address buyer = makeAddr("buyer");
@@ -348,6 +394,9 @@ contract MemeLaunchpadTest is Test {
         // Create token as creator
         vm.prank(creator);
         address tokenAddress = launchpad.createToken("PublicToken", "PT", "Public metadata");
+
+        // Unlock the token first
+        unlockToken(tokenAddress);
 
         address buyer = makeAddr("buyer");
         uint256 ethAmount = 1e18;

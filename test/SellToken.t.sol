@@ -18,10 +18,42 @@ contract SellTokenTest is Test {
         launchpad = new MemeLaunchpad(treasury, dexRouter);
     }
 
+    // Helper function to unlock a token by having the creator buy enough tokens
+    // Unlock threshold is 2% of max supply = 20M tokens
+    function unlockToken(address tokenAddress) internal {
+        // Check if already unlocked
+        if (launchpad.tokenUnlocked(tokenAddress)) {
+            return;
+        }
+        
+        uint256 maxSupply = 1_000_000_000 * 1e18;
+        uint256 unlockThreshold = (maxSupply * 2) / 100; // 20M tokens
+        
+        // Buy tokens until unlocked
+        uint256 maxIterations = 100; // Safety limit
+        for (uint256 i = 0; i < maxIterations && !launchpad.tokenUnlocked(tokenAddress); i++) {
+            uint256 currentBought = launchpad.creatorBoughtAmount(tokenAddress, creator);
+            if (currentBought >= unlockThreshold) {
+                break;
+            }
+            
+            // Give creator enough ETH for this purchase (refresh balance each iteration)
+            uint256 ethAmount = 5000e18;
+            vm.deal(creator, ethAmount);
+            
+            // Buy with a reasonable amount of ETH
+            vm.prank(creator);
+            launchpad.buyTokens{value: ethAmount}(tokenAddress, 1);
+        }
+    }
+
     function testSellTokens() public {
         // Create a token
         vm.prank(creator);
         address tokenAddress = launchpad.createToken("SellToken", "ST", "Sell metadata");
+
+        // Unlock the token first
+        unlockToken(tokenAddress);
 
         // Buy some tokens first to have circulating supply
         address buyer = makeAddr("buyer");
@@ -57,6 +89,9 @@ contract SellTokenTest is Test {
         vm.prank(creator);
         address tokenAddress = launchpad.createToken("FailSellToken", "FST", "Fail metadata");
 
+        // Unlock the token first
+        unlockToken(tokenAddress);
+
         // Buy some tokens
         address buyer = makeAddr("buyer");
         uint256 buyEth = 1e18;
@@ -91,6 +126,9 @@ contract SellTokenTest is Test {
         // Create a token
         vm.prank(creator);
         address tokenAddress = launchpad.createToken("ExceedToken", "ET", "Exceed metadata");
+
+        // Unlock the token first
+        unlockToken(tokenAddress);
 
         // Buy some tokens
         address buyer = makeAddr("buyer");
