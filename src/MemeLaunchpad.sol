@@ -21,7 +21,7 @@ interface IDEXRouter {
 /**
  * @title MemeLaunchpad
  * @notice Main contract for creating and managing meme tokens with bonding curve mechanics
- * @dev Implements a pump.fun-style bonding curve where tokens can be bought/sold before DEX migration
+ * @dev Implements a bonding curve where tokens can be bought/sold before DEX migration
  */
 contract MemeLaunchpad {
     // ==================== ACCESS CONTROL ====================
@@ -92,6 +92,11 @@ contract MemeLaunchpad {
         address indexed tokenAddress,
         address indexed creator,
         uint256 creatorBoughtAmount
+    );
+
+    event DEXRouterUpdated(
+        address indexed oldRouter,
+        address indexed newRouter
     );
 
     // ==================== CUSTOM ERRORS ====================
@@ -218,6 +223,15 @@ contract MemeLaunchpad {
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Invalid owner");
         _owner = newOwner;
+    }
+
+    /// @notice Updates the DEX router address
+    /// @param newDexRouter Address of the new DEX router
+    function setDexRouter(address newDexRouter) external onlyOwner {
+        require(newDexRouter != address(0), "Invalid router");
+        address oldRouter = dexRouter;
+        dexRouter = newDexRouter;
+        emit DEXRouterUpdated(oldRouter, newDexRouter);
     }
 
     // ==================== TOKEN CREATION ====================
